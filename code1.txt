@@ -1,0 +1,280 @@
+# rl_scheduler_reinforce.py
+"""
+Reinforcement Learning scheduler (REINFORCE) — simple implementation.
+
+Objective: learn an order of processing to minimize total tardiness.
+State: for N orders (fixed max_n), each order represented by:
+       [remaining_time_norm, time_to_deadline_norm, priority_norm, done_flag]
+Action: select index (0..N-1) of next job to process (only allowed if not done).
+Reward: negative sum of tardiness at episode end (we accumulate intermediate rewards 0, final large negative)
+Episode: finish when all jobs done or max steps reached.
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import os
+import datetime
+
+# ---------------------------
+# Config / Hyperparameters
+# ---------------------------
+SEED = 1
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+MAX_JOBS = 15            # fixed-size state (pad if fewer)
+TIME_UNIT = 1.0          # minutes per step unit when we "process" a job
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+HIDDEN = 128
+LR = 1e-3
+GAMMA = 0.99
+ENTROPY_WEIGHT = 1e-3
+BATCH_SIZE = 1           # using REINFORCE (episodic), batch=1
+EPISODES = 2000
+MAX_STEPS = 1000         # safety cap
+
+SAVE_PATH = "policy_model.pth"
+
+# ---------------------------
+# Example orders dataset
+# (you can replace this with a CSV loader)
+# ---------------------------
+def load_orders():
+    # returns list of dicts; each order has: id, est_process (minutes), deadline (datetime), priority (1-3)
+    now = datetime.datetime(2025, 10, 16, 8, 0)  # reference start time
+    orders = [
+        {"id":"O001","est":60,"deadline": now + datetime.timedelta(hours=6),"priority":3},
+        {"id":"O002","est":50,"deadline": now + datetime.timedelta(hours=26),"priority":2},
+        {"id":"O003","est":30,"deadline": now + datetime.timedelta(hours=10),"priority":2},
+        {"id":"O004","est":45,"deadline": now + datetime.timedelta(hours=4),"priority":3},
+        {"id":"O005","est":25,"deadline": now + datetime.timedelta(hours=9),"priority":2},
+        {"id":"O006","est":15,"deadline": now + datetime.timedelta(hours=4),"priority":1},
+        {"id":"O007","est":40,"deadline": now + datetime.timedelta(hours=7),"priority":3},
+        {"id":"O008","est":70,"deadline": now + datetime.timedelta(hours=25),"priority":3},
+        {"id":"O009","est":30,"deadline": now + datetime.timedelta(hours=12),"priority":1},
+        {"id":"O010","est":35,"deadline": now + datetime.timedelta(hours=8),"priority":2},
+        {"id":"O011","est":50,"deadline": now + datetime.timedelta(hours=15),"priority":3},
+        {"id":"O012","est":20,"deadline": now + datetime.timedelta(hours=22),"priority":2},
+        {"id":"O013","est":15,"deadline": now + datetime.timedelta(hours=7.5),"priority":2},
+        {"id":"O014","est":25,"deadline": now + datetime.timedelta(hours=6.5),"priority":3},
+        {"id":"O015","est":20,"deadline": now + datetime.timedelta(hours=9.5),"priority":2},
+    ]
+    start_time = now
+    return orders, start_time
+
+# ---------------------------
+# Environment
+# ---------------------------
+class SchedulingEnv:
+    def __init__(self, orders, start_time, max_jobs=MAX_JOBS):
+        self.raw_orders = orders
+        self.start_time = start_time
+        self.max_jobs = max_jobs
+        self.reset()
+
+    def reset(self):
+        # create internal copy of orders with mutable fields
+        self.time = self.start_time
+        self.jobs = []
+        for o in self.raw_orders:
+            self.jobs.append({
+                "id": o["id"],
+                "remaining": float(o["est"]),
+                "deadline": o["deadline"],
+                "est": float(o["est"]),
+                "priority": float(o["priority"]),
+                "started": False,
+                "finished_time": None
+            })
+        # pad to max_jobs
+        while len(self.jobs) < self.max_jobs:
+            self.jobs.append({"id":"PAD","remaining":0.0,"deadline":self.start_time,"est":0.0,"priority":0.0,"started":True,"finished_time":None})
+        self.done = False
+        return self._get_state()
+
+    def _get_state(self):
+        rem = np.array([j["remaining"] for j in self.jobs], dtype=np.float32)
+        max_est = max([j["est"] for j in self.jobs] + [1.0])
+        rem_n = rem / (max_est + 1e-6)
+
+        time_to_deadline = np.array([(j["deadline"] - self.time).total_seconds()/60.0 for j in self.jobs], dtype=np.float32)
+        horizon = 24*60.0
+        ttd_n = (time_to_deadline / horizon).astype(np.float32)
+
+        prio = np.array([j["priority"] for j in self.jobs], dtype=np.float32) / 3.0
+        done_flag = np.array([1.0 if j["started"] and j["remaining"]<=0.0 or j["id"]=="PAD" else 0.0 for j in self.jobs], dtype=np.float32)
+
+        state = np.stack([rem_n, ttd_n, prio, done_flag], axis=1)
+        return state
+
+    def step(self, action_idx):
+        if self.done:
+            raise Exception("step on done env")
+
+        job = self.jobs[action_idx]
+        info = {}
+
+        if job["id"] == "PAD" or (job["started"] and job["remaining"]<=0.0):
+            reward = -1.0
+            next_state = self._get_state()
+            return next_state, reward, False, {"invalid": True}
+
+        process_time = job["remaining"]
+        self.time = self.time + datetime.timedelta(minutes=float(process_time))
+        job["remaining"] = 0.0
+        job["started"] = True
+        job["finished_time"] = self.time
+
+        all_done = all([(j["id"]=="PAD") or (j["remaining"]<=0.0) for j in self.jobs])
+        self.done = all_done
+
+        if self.done:
+            total_tardy = 0.0
+            for j in self.jobs:
+                if j["id"]=="PAD": continue
+                finish = j["finished_time"]
+                due = j["deadline"]
+                tard = max(0.0, (finish - due).total_seconds()/60.0)
+                total_tardy += tard * (1.0 + (3.0 - j["priority"]) * 0.1)
+            reward = - total_tardy
+        else:
+            reward = 0.0
+
+        next_state = self._get_state()
+        return next_state, reward, self.done, info
+
+# ---------------------------
+# Policy Network
+# ---------------------------
+class PolicyNet(nn.Module):
+    def __init__(self, max_jobs=MAX_JOBS, hidden=HIDDEN):
+        super().__init__()
+        input_dim = max_jobs * 4
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU()
+        )
+        self.action_head = nn.Linear(hidden, max_jobs)
+
+    def forward(self, state):
+        b = state.shape[0]
+        x = state.view(b, -1)
+        h = self.net(x)
+        logits = self.action_head(h)
+        return logits
+
+# ---------------------------
+# Utilities for policy gradient
+# ---------------------------
+def select_action(policy, state_np):
+    state = torch.tensor(state_np[None, ...], dtype=torch.float32, device=DEVICE)
+    logits = policy(state)
+    done_flags = state_np[:,3]
+    mask = (done_flags >= 0.999).astype(np.bool_)
+    mask_tensor = torch.tensor(mask, device=DEVICE)
+    logits[0, mask_tensor] = -1e9
+    probs = torch.softmax(logits, dim=1)
+    m = torch.distributions.Categorical(probs)
+    action = m.sample()
+    return int(action.item()), m.log_prob(action), m.entropy()
+
+# ---------------------------
+# Training loop (REINFORCE)
+# ---------------------------
+def train():
+    orders, start_time = load_orders()
+    env = SchedulingEnv(orders, start_time, max_jobs=MAX_JOBS)
+    policy = PolicyNet(max_jobs=MAX_JOBS).to(DEVICE)
+    optimizer = optim.Adam(policy.parameters(), lr=LR)
+
+    print("Training REINFORCE on example scheduling problem...")
+    for ep in range(1, EPISODES+1):
+        state = env.reset()
+        log_probs, entropies, rewards = [], [], []
+        step = 0
+        while True:
+            action, logp, ent = select_action(policy, state)
+            next_state, reward, done, info = env.step(action)
+            log_probs.append(logp)
+            entropies.append(ent)
+            rewards.append(reward)
+            state = next_state
+            step += 1
+            if done or step > MAX_STEPS:
+                break
+
+        returns, G = [], 0.0
+        for r in reversed(rewards):
+            G = r + GAMMA * G
+            returns.insert(0, G)
+        returns = torch.tensor(returns, dtype=torch.float32, device=DEVICE)
+        if returns.std().item() > 1e-6:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+
+        loss = 0.0
+        for logp, Gt, ent in zip(log_probs, returns, entropies):
+            loss = loss - logp * Gt - ENTROPY_WEIGHT * ent
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if ep % 100 == 0 or ep == 1:
+            print(f"Ep {ep}/{EPISODES} | Steps {step} | Final Reward {rewards[-1]:.2f} | Loss {loss.item():.4f}")
+
+    torch.save(policy.state_dict(), SAVE_PATH)
+    print(f"Training finished. Model saved to {SAVE_PATH}")
+    return policy, env
+
+# ---------------------------
+# Evaluation / Greedy rollout using trained policy
+# ---------------------------
+def rollout_greedy(policy, orders, start_time):
+    env = SchedulingEnv(orders, start_time, max_jobs=MAX_JOBS)
+    state = env.reset()
+    seq, total_reward, step = [], 0.0, 0
+    while True:
+        with torch.no_grad():
+            s = torch.tensor(state[None, ...], dtype=torch.float32, device=DEVICE)
+            logits = policy(s).cpu().numpy().flatten()
+            done_mask = state[:,3] >= 0.999
+            logits[done_mask] = -1e9
+            act = int(np.argmax(logits))
+        next_state, reward, done, info = env.step(act)
+        seq.append(env.jobs[act]["id"])
+        total_reward += reward
+        state = next_state
+        step += 1
+        if done or step > MAX_STEPS:
+            break
+
+    tard_list = []
+    for j in env.jobs:
+        if j["id"]=="PAD": continue
+        due = j["deadline"]
+        fin = j["finished_time"]
+        tard = max(0.0, (fin - due).total_seconds()/60.0)
+        tard_list.append((j["id"], fin.strftime("%Y-%m-%d %H:%M"), due.strftime("%Y-%m-%d %H:%M"), tard))
+    return seq, total_reward, tard_list
+
+# ---------------------------
+# Main
+# ---------------------------
+if __name__ == "__main__":
+    policy, env = train()
+
+    orders, start_time = load_orders()
+    seq, total_reward, tard = rollout_greedy(policy, orders, start_time)
+    print("\nGreedy rollout sequence (IDs in order processed):")
+    print(seq)
+    print(f"\nTotal reward (negative total tardiness): {total_reward:.2f}")
+    print("\nPer job finish / due / tardiness (minutes):")
+    for t in tard:
+        print(t)
