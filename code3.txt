@@ -1,0 +1,330 @@
+import pandas as pd
+import numpy as np
+import re
+from sklearn.neighbors import KNeighborsRegressor
+import holidays
+
+# --- FUNGSI PARSING DIMENSI STANDAR ---
+def clean_cols(df):
+    df.columns = [str(c).strip().replace(' ', '').replace('\n', '') for c in df.columns]
+    return df
+
+def parse_dim_standar(x):
+    if pd.isna(x) or str(x).strip() == "": 
+        return (0.0, 0.0, 0.0)
+    nums = re.findall(r"[0-9]+\.?[0-9]*", str(x))
+    nums = [float(n) for n in nums]
+    while len(nums) < 3: 
+        nums.append(0.0)
+    return tuple(nums[:3])
+
+# --- LOGIKA PEMISAHAN JALUR EKSKLUSIF ---
+def cek_jalur_spesifik(row):
+    text_orig = str(row['品名_Original']).upper()
+    text_target = str(row['品名_Target_X']).upper()
+    combined = f"{text_orig} {text_target}"
+    
+    if "サヤ" in combined or "ｻﾔ" in combined or "SAYA" in combined:
+        return "SAYA UCHI", 1.25  
+        
+    fitur_bolong = ["Φ", "φ", "-35D", "35D", "CC", "BOLONG"]
+    ada_tanda_bolong = any(f in combined for f in fitur_bolong)
+    
+    nums_orig = re.findall(r"[0-9]+\.?[0-9]*", text_orig)
+    if ada_tanda_bolong or (len(nums_orig) >= 4 and any(x in text_orig for x in ["D", "CC", "L-"])):
+        return "PROSES PERFORASI/BOLONG", 1.25  
+        
+    return "NORMAL", 1.0
+
+def parse_hon_dori(text_orig, text_target):
+    combined_text = f"{str(text_orig)} {str(text_target)}"
+    match = re.search(r"([0-9]+)\s*本取", combined_text)
+    if match:
+        return int(match.group(1))
+    return 1
+
+# =============================================================
+# 1. LOAD DATA & DATA TRAINING MODEL KNN
+# =============================================================
+order_df = pd.DataFrame()
+
+try:
+    path_order = "C:/Users/USER/Downloads/as/order.xlsx"
+    path_history = "C:/Users/USER/Downloads/as/p1.xlsx"
+
+    proc1_df = pd.read_excel(path_history, engine="openpyxl")
+    proc1_df = clean_cols(proc1_df)
+    proc1_df[['d1','d2','length']] = proc1_df['品名'].apply(lambda x: pd.Series(parse_dim_standar(x)))
+    
+    col_speed = [c for c in proc1_df.columns if '個' in c and 'h' in c][0]
+    proc1_df['speed_pcs_h'] = pd.to_numeric(proc1_df[col_speed], errors='coerce')
+    proc1_df = proc1_df.dropna(subset=['speed_pcs_h', 'd1', 'd2', 'length'])
+
+    proc1_df['key_dim'] = proc1_df['d1'].astype(str) + "_" + proc1_df['d2'].astype(str) + "_" + proc1_df['length'].astype(str)
+    
+    cleaned_rows = []
+    for dim_key, group in proc1_df.groupby('key_dim'):
+        if len(group) <= 3:
+            best_row = group.loc[[group['speed_pcs_h'].idxmax()]]
+            cleaned_rows.append(best_row)
+        else:
+            limit_bawah = group['speed_pcs_h'].quantile(0.20)
+            clean_group = group[group['speed_pcs_h'] >= limit_bawah]
+            cleaned_rows.append(clean_group)
+            
+    proc1_df_clean = pd.concat(cleaned_rows, ignore_index=True)
+    proc1_df_clean['hours_per_unit'] = 1 / proc1_df_clean['speed_pcs_h']
+
+    model = KNeighborsRegressor(n_neighbors=2, weights='distance', metric='manhattan')
+    model.fit(proc1_df_clean[['d1', 'd2', 'length']], proc1_df_clean['hours_per_unit'])
+
+    all_sheets = pd.read_excel(path_order, engine="openpyxl", header=None, sheet_name=None)
+    list_df = []
+    ignored_keywords = ['ｽﾘｰﾌﾞ', 'スリーブ'] 
+
+    for sheet_name, df_raw in all_sheets.items():
+        if 'ナカヤマ' in sheet_name: continue 
+        
+        header_row = None
+        for i in range(min(25, len(df_raw))):
+            if df_raw.iloc[i].astype(str).str.contains('品名').any():
+                header_row = i
+                break
+        
+        if header_row is not None:
+            df = df_raw.iloc[header_row:].copy()
+            df.columns = df.iloc[0]
+            df = df[1:].reset_index(drop=True)
+            df = clean_cols(df)
+            
+            qty_indices = [i for i, c in enumerate(df.columns) if '受注数量' in str(c)]
+            ship_indices = [i for i, c in enumerate(df.columns) if '出荷日' in str(c)]
+            order_indices = [i for i, c in enumerate(df.columns) if '受注年月日' in str(c)]
+
+            if len(df.columns) > 23 and qty_indices:
+                temp = pd.DataFrame()
+                temp['品名_Original'] = df.iloc[:, 13] 
+                temp['品名_Target_X'] = df.iloc[:, 23] 
+                temp['Qty'] = pd.to_numeric(df.iloc[:, qty_indices[0]], errors='coerce').fillna(0)
+                
+                final_orders = []
+                final_ships = []
+                for idx_row in range(len(df)):
+                    raw_order = df.iloc[idx_row, order_indices[0]]
+                    raw_ship = df.iloc[idx_row, ship_indices[0]]
+                    o_date = pd.to_datetime(raw_order, dayfirst=True, errors='coerce')
+                    s_date = pd.to_datetime(raw_ship, dayfirst=True, errors='coerce')
+                    if pd.notna(o_date) and pd.notna(s_date):
+                        if s_date.month < o_date.month:
+                            s_date = s_date.replace(year=o_date.year + 1)
+                        else:
+                            s_date = s_date.replace(year=o_date.year)
+                    final_orders.append(o_date)
+                    final_ships.append(s_date)
+                
+                temp['Shipment'] = final_ships
+                temp['Order_Date'] = final_orders
+                temp['Sheet'] = sheet_name
+                
+                temp = temp[temp['Qty'] > 0].dropna(subset=['品名_Target_X', 'Order_Date', 'Shipment'])
+                temp = temp[~temp['品名_Original'].astype(str).str.contains('|'.join(ignored_keywords), na=False)]
+                temp = temp[~temp['品名_Target_X'].astype(str).str.contains('|'.join(ignored_keywords), na=False)]
+                list_df.append(temp)
+
+    if list_df:
+        order_df = pd.concat(list_df, ignore_index=True)
+
+    if not order_df.empty:
+        # PRIORITAS TANGGAL SHIPMENT YANG PALING DEKAT
+        order_df = order_df.sort_values(by=['Shipment', 'Order_Date']).reset_index(drop=True)
+        order_df['Is_Merged'] = False
+
+        consolidated_list = []
+        skip_indices = set()
+        for i in range(len(order_df)):
+            if i in skip_indices: continue
+            current_row = order_df.iloc[i].copy()
+            for j in range(i + 1, len(order_df)):
+                if j in skip_indices: continue
+                next_row = order_df.iloc[j]
+                if current_row['品名_Target_X'] == next_row['品名_Target_X'] and current_row['Sheet'] == next_row['Sheet']:
+                    selisih_hari = (next_row['Shipment'] - current_row['Shipment']).days
+                    if 0 <= selisih_hari <= 2:
+                        current_row['Qty'] += next_row['Qty']  
+                        current_row['品名_Original'] = f"{current_row['品名_Original']} + {int(next_row['Qty'])}pcs (Gabung Mesin)"
+                        current_row['Shipment'] = min(current_row['Shipment'], next_row['Shipment'])
+                        current_row['Is_Merged'] = True 
+                        skip_indices.add(j)  
+                    else:
+                        break
+                else:
+                    break
+            consolidated_list.append(current_row)
+        order_df = pd.DataFrame(consolidated_list)
+
+except Exception as e:
+    print(f"Error Loading: {e}")
+
+# =============================================================
+# 2. PROSES PENJADWALAN AUTOMATIS (VERSI MK18 - FULL PRODUKSI)
+# =============================================================
+if not order_df.empty:
+    res_dim_order = order_df['品名_Target_X'].apply(lambda x: pd.Series(parse_dim_standar(x)))
+    order_df['d1'] = res_dim_order[0]
+    order_df['d2'] = res_dim_order[1]
+    order_df['length'] = res_dim_order[2]
+    
+    jalur_info = order_df.apply(lambda r: cek_jalur_spesifik(r), axis=1)
+    order_df['Kategori_Jalur'] = [info[0] for info in jalur_info]
+    order_df['Pengali_Durasi'] = [info[1] for info in jalur_info]
+
+    order_df['Hon_Dori'] = order_df.apply(lambda r: parse_hon_dori(r['品名_Original'], r['品名_Target_X']), axis=1)
+    order_df['Qty_Mesin'] = order_df['Qty'] / order_df['Hon_Dori']
+
+    pred_hours_per_unit = model.predict(order_df[['d1', 'd2', 'length']])
+    standard_hours_per_unit = np.clip(pred_hours_per_unit, a_min=0.001, a_max=0.05)
+    order_df['hours_per_unit'] = standard_hours_per_unit
+    order_df['Durasi_Jam'] = (standard_hours_per_unit * order_df['Qty_Mesin']) * order_df['Pengali_Durasi']
+
+    jp_holidays = holidays.Japan(years=[2025, 2026])
+    company_custom_holidays = {
+        '2025-08-13', '2025-08-14', '2025-08-15', 
+        '2025-12-29', '2025-12-30', '2025-12-31', 
+        '2026-01-02', '2026-01-03'
+    }
+    company_working_saturdays = {
+        '2025-12-27', '2025-05-10',
+    }
+
+    queue = order_df.to_dict(orient='records')
+    
+    queue_sorted_ship = sorted(queue, key=lambda x: x['Shipment'])
+    current_time = queue_sorted_ship[0]['Order_Date'].replace(hour=8, minute=30, second=0)
+
+    final_results = []
+    last_product = None
+
+    while len(queue) > 0:
+        current_date_str = current_time.strftime('%Y-%m-%d')
+        current_date_only = current_time.date()
+        
+        is_holiday = current_date_only in jp_holidays or current_date_str in company_custom_holidays
+        is_weekend = current_time.weekday() >= 5
+        is_working_saturday = (current_time.weekday() == 5) and (current_date_str in company_working_saturdays)
+
+        if (is_weekend or is_holiday) and not is_working_saturday:
+            current_time += pd.Timedelta(days=1)
+            current_time = current_time.replace(hour=8, minute=30)
+            continue
+
+        best_index = 0
+        max_priority_score = -999999999
+
+        for idx, job in enumerate(queue):
+            if job['Order_Date'] > current_time:
+                total_score = -99999999 + (1 / (job['Order_Date'] - current_time).total_seconds())
+            else:
+                sisa_hari_kirim = (job['Shipment'] - current_time).total_seconds() / 86400
+                
+                if sisa_hari_kirim <= 3:
+                    urgency_score = 5000000 + abs(sisa_hari_kirim) * 500000
+                else:
+                    urgency_score = 100000 / (sisa_hari_kirim + 0.1)
+                
+                proses_bonus = 300 if job['Kategori_Jalur'] != "NORMAL" else 0
+                setup_bonus = 200 if (last_product is not None and job['品名_Target_X'] == last_product) else 0
+                
+                total_score = urgency_score + setup_bonus + proses_bonus
+            
+            if total_score > max_priority_score:
+                max_priority_score = total_score
+                best_index = idx
+
+        row = queue.pop(best_index)
+        remain = row['Durasi_Jam']
+        durasi_asli_jam = row['Durasi_Jam']
+        current_product = row['品名_Target_X']
+        
+        if last_product is not None and current_product != last_product:
+            remain += (20 / 60)
+            durasi_asli_jam += (20 / 60)
+
+        last_product = current_product
+
+        if current_time < row['Order_Date']:
+            current_time = row['Order_Date']
+            if current_time.hour < 8 or (current_time.hour == 8 and current_time.minute < 30):
+                current_time = current_time.replace(hour=8, minute=30, second=0)
+
+        produksi_start = current_time
+        real_deadline_limit = row['Shipment'].replace(hour=17, minute=30)
+
+        is_late_risk = False
+
+        while remain > 0:
+            current_date_only = current_time.date()
+            current_date_str = current_time.strftime('%Y-%m-%d')
+            
+            inner_holiday = current_date_only in jp_holidays or current_date_str in company_custom_holidays
+            inner_weekend = current_time.weekday() >= 5
+            inner_working_sat = (current_time.weekday() == 5) and (current_date_str in company_working_saturdays)
+
+            if (inner_weekend or inner_holiday) and not inner_working_sat:
+                current_time += pd.Timedelta(days=1)
+                current_time = current_time.replace(hour=8, minute=30)
+                continue
+
+            if current_time + pd.to_timedelta(remain, unit='h') > real_deadline_limit:
+                is_late_risk = True
+            
+            max_h, max_m = (19, 30) if is_late_risk else (17, 30)
+            work_end = current_time.replace(hour=max_h, minute=max_m, second=0)
+            lunch_s = current_time.replace(hour=12, minute=0, second=0)
+            lunch_e = current_time.replace(hour=13, minute=0, second=0)
+
+            if current_time >= work_end:
+                current_time += pd.Timedelta(days=1)
+                current_time = current_time.replace(hour=8, minute=30)
+                continue
+            
+            if current_time >= lunch_s and current_time < lunch_e:
+                current_time = lunch_e
+                continue
+                
+            next_limit = lunch_s if current_time < lunch_s else work_end
+            avail = (next_limit - current_time).total_seconds() / 3600
+            process = min(remain, avail)
+            remain -= process
+            current_time += pd.Timedelta(hours=process)
+        
+        produksi_end = current_time
+
+        prefix_list = []
+        if row['Is_Merged']: prefix_list.append("GABUNGAN MESIN")
+        if row['Kategori_Jalur'] != "NORMAL": prefix_list.append(row['Kategori_Jalur'])
+        prefix = f"[{' + '.join(prefix_list)}] " if prefix_list else ""
+        
+        if produksi_end <= real_deadline_limit:
+            status_jadwal = f"{prefix}AMAN (SELESAI SEBELUM KIRIM)"
+        else:
+            status_jadwal = f"{prefix}TERLAMBAT"
+
+        catatan_hari = " (Sabtu Kerja)" if produksi_start.weekday() == 5 else ""
+
+        final_results.append({
+            'Sheet': row['Sheet'],
+            'Order_Date': row['Order_Date'].strftime('%Y-%m-%d'),
+            '品名_Original': row['品名_Original'],
+            '品名_Target(X)': row['品名_Target_X'],
+            'Qty_Order_Pcs': row['Qty'],
+            'Faktor_Potong': f"{row['Hon_Dori']}本取",
+            'Durasi_Produksi_Jam': round(durasi_asli_jam, 2),
+            'Mulai_Produksi': produksi_start.strftime('%Y-%m-%d  [%H:%M]') + catatan_hari,
+            'Selesai_Produksi': produksi_end.strftime('%Y-%m-%d  [%H:%M]'),
+            'Tanggal_Kirim_Shipment': real_deadline_limit.strftime('%Y-%m-%d'),
+            'Tipe_Shift': "LEMBUR" if is_late_risk else "NORMAL",
+            'Status_Untuk_Kachou': status_jadwal
+        })
+
+    pd.DataFrame(final_results).to_excel("C:/Users/USER/Downloads/as/Jadwal_Produksi_Final_FixedMK12.xlsx", index=False)
+    print("Selesai! File MK12 format final sukses diterbitkan.")
