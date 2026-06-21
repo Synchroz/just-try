@@ -1,0 +1,545 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import pandas as pd
+import numpy as np
+import re
+import math
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.preprocessing import StandardScaler
+import holidays
+
+# --- KONSTANTA & CONFIG ---
+THRESHOLD_LARGE_ORDER = 2000
+
+# =============================================================
+# ENGINE INTI PENJADWALAN (Fungsi Utama)
+# =============================================================
+def clean_cols(df):
+    df.columns = [str(c).strip().replace(' ', '').replace('\n', '') for c in df.columns]
+    return df
+
+def parse_dim_standar(x):
+    if pd.isna(x) or str(x).strip() == "": 
+        return (0.0, 0.0, 0.0)
+    text = str(x).replace(' ', ' ').strip().replace('（', '(').replace('）', ')')
+    nums = re.findall(r"[0-9]+\.?[0-9]*", text)
+    nums = [float(n) for n in nums]
+    match_kurung = re.search(r"^[0-9]+\.?[0-9]*\s*\([^)]+\)", text)
+    if match_kurung and len(nums) >= 4:
+        nums.pop(1)
+    while len(nums) < 3: 
+        nums.append(0.0)
+    return tuple(nums[:3])
+
+def get_core_product_name(text):
+    t = str(text).strip()
+    if '/' in t: return t.split('/')[0].strip()  
+    if '／' in t: return t.split('／')[0].strip()
+    return t
+
+def tentukan_max_kapasitas(dim_text):
+    d1, d2, length = parse_dim_standar(dim_text)
+    if d1 >= 28.6 or length >= 500.0: return 300  
+    return 1000 
+
+def ekstrak_fitur_material(text):
+    text_upper = str(text).upper()
+    jopo = 1 if "上ポ" in text_upper or "上ﾎﾟ" in text_upper else 0
+    polysand = 1 if "ﾎﾟﾘｻﾝﾄﾞ" in text_upper or "ポリサンド" in text_upper else 0
+    return jopo, polysand
+
+def cek_jalur_spesifik(row):
+    text_orig = str(row['品名_Original']).upper()
+    text_target = str(row['品名_Target_X']).upper()
+    combined = f"{text_orig} {text_target}"
+    
+    # 🛑 GARDA PENGAMAN SLEEVE: Jika mengandung kata Sleeve/スリーブ, dijamin BUKAN perforasi
+    if "スリーブ" in combined or "ｽﾘｰﾌﾞ" in combined:
+        return "NORMAL", 1.0
+        
+    if "サヤ" in combined or "ｻﾔ" in combined or "SAYA" in combined:
+        return "SAYA UCHI", 1.25  
+        
+    fitur_bolong = ["-35D", "35D", "CC", "BOLONG", "-Φ", "-φ"]
+    ada_tanda_bolong = any(f in combined for f in fitur_bolong)
+    
+    if not ada_tanda_bolong and ("Φ" in combined or "φ" in combined):
+        if re.search(r"-\s*[φΦ]", combined):
+            ada_tanda_bolong = True
+
+    nums_orig = re.findall(r"[0-9]+\.?[0-9]*", text_orig)
+    if ada_tanda_bolong or (len(nums_orig) >= 4 and any(x in text_orig for x in ["D", "CC", "L-"])):
+        return "PROSES PERFORASI/BOLONG", 1.25  
+    return "NORMAL", 1.0
+
+def parse_hon_dori(text_orig, text_target):
+    combined_text = f"{str(text_orig)} {str(text_target)}"
+    match = re.search(r"([0-9]+)\s*本取", combined_text)
+    return int(match.group(1)) if match else 1
+
+def get_setup_time_hours(last_row, current_row):
+    if last_row is None: return 0.0
+    last_core = get_core_product_name(last_row['品名_Target_X'])
+    curr_core = get_core_product_name(current_row['品名_Target_X'])
+    if last_core == curr_core:
+        return 5 / 60 if abs(last_row['length'] - current_row['length']) >= 0.1 else 0.0
+    if abs(last_row['d1'] - current_row['d1']) >= 0.01: return 20 / 60
+    if last_row['d2'] != current_row['d2']: return 10 / 60
+    return 5 / 60 if abs(last_row['length'] - current_row['length']) >= 0.1 else 0.0
+
+def majukan_waktu_simulasi(start_time, durasi_jam, is_late_risk, jp_holidays, company_custom_holidays, company_working_saturdays):
+    remain = durasi_jam
+    current_time = start_time
+    while remain > 0:
+        current_date_only = current_time.date()
+        current_date_str = current_time.strftime('%Y-%m-%d')
+        is_holiday = current_date_only in jp_holidays or current_date_str in company_custom_holidays
+        is_weekend = current_time.weekday() >= 5
+        is_working_saturday = (current_time.weekday() == 5 and current_date_str in company_working_saturdays)
+
+        if (is_weekend or is_holiday) and not is_working_saturday:
+            current_time += pd.Timedelta(days=1)
+            current_time = current_time.replace(hour=8, minute=30, second=0)
+            continue
+
+        max_h, max_m = (19, 30) if is_late_risk else (17, 30)
+        work_end = current_time.replace(hour=max_h, minute=max_m, second=0)
+        lunch_s = current_time.replace(hour=12, minute=0, second=0)
+        lunch_e = current_time.replace(hour=13, minute=0, second=0)
+
+        if current_time >= work_end:
+            current_time += pd.Timedelta(days=1)
+            current_time = current_time.replace(hour=8, minute=30, second=0)
+            continue
+        if lunch_s <= current_time < lunch_e:
+            current_time = lunch_e
+            continue
+
+        next_limit = lunch_s if current_time < lunch_s else work_end
+        avail = (next_limit - current_time).total_seconds() / 3600
+        process = min(remain, avail)
+        remain -= process
+        current_time += pd.Timedelta(hours=process)
+    return current_time
+
+def tentukan_status_produksi_internal(row, histori_list):
+    text_target = str(row['品名_Target_X']).upper()
+    text_orig = str(row['品名_Original']).upper()
+    gabung_teks = f"{text_target} {text_orig}"
+    
+    if abs(row['d1'] - 18.5) < 0.05 and ("赤" in gabung_teks or "RED" in gabung_teks): 
+        return False
+        
+    # ⭐ PRIORITAS 1: Scan kesamaan dengan data pembelajaran histori
+    for h in histori_list:
+        if abs(row['d2'] - h['d2']) < 0.01 and row['Fitur_JoPo'] == h['Fitur_JoPo'] and row['Fitur_Polysand'] == h['Fitur_Polysand']:
+            if abs(row['d1'] - h['d1']) < 1.0: 
+                return True
+                
+    # ⭐ PRIORITAS 2: Jika diinput via UI (darurat), meskipun tipe baru tetap izinkan internal produksi
+    if "[INPUT MANUAL UI]" in str(row['Sheet']): 
+        return True
+        
+    return False
+
+# =============================================================
+# FUNGSI PROSES UTAMA (DIPANGGIL OLEH TOMBOL UI)
+# =============================================================
+def jalankan_optimasi(mode, df_manual_urgent=None):
+    try:
+        path_order = "C:/Users/USER/Downloads/as/●保護管事業出荷予定表 _202507～  (1).xlsx"
+        path_history = "C:/Users/USER/Downloads/as/作業報告書・ｽﾊﾟｲﾗﾙ用 (1).xlsx"
+
+        # 1. Load Data Training Model
+        proc1_df = pd.read_excel(path_history, engine="openpyxl")
+        proc1_df = clean_cols(proc1_df)
+        proc1_df[['d1','d2','length']] = proc1_df['品名'].apply(lambda x: pd.Series(parse_dim_standar(x)))
+        res_mat_hist = proc1_df['品名'].apply(lambda x: pd.Series(ekstrak_fitur_material(x)))
+        proc1_df['Fitur_JoPo'], proc1_df['Fitur_Polysand'] = res_mat_hist[0], res_mat_hist[1]
+        
+        col_speed = [c for c in proc1_df.columns if '個' in c and 'h' in c][0]
+        proc1_df['speed_pcs_h'] = pd.to_numeric(proc1_df[col_speed], errors='coerce')
+        proc1_df = proc1_df.dropna(subset=['speed_pcs_h', 'd1', 'd2', 'length'])
+        
+        df_unique_hist = proc1_df[['d1', 'd2', 'Fitur_JoPo', 'Fitur_Polysand']].drop_duplicates()
+        list_histori_matriks = df_unique_hist.to_dict(orient='records')
+
+        proc1_df['key_dim'] = (proc1_df['d1'].astype(str) + "_" + proc1_df['d2'].astype(str) + "_" + proc1_df['length'].astype(str))
+        cleaned_rows = [g.loc[[g['speed_pcs_h'].idxmax()]] if len(g) <= 3 else g[g['speed_pcs_h'] >= g['speed_pcs_h'].quantile(0.20)] for _, g in proc1_df.groupby('key_dim')]
+        proc1_df_clean = pd.concat(cleaned_rows, ignore_index=True)
+        proc1_df_clean['hours_per_unit'] = 1 / proc1_df_clean['speed_pcs_h']
+
+        X_train = proc1_df_clean[['d1', 'd2', 'length', 'Fitur_JoPo', 'Fitur_Polysand']]
+        y_train = proc1_df_clean['hours_per_unit']
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        model = KNeighborsRegressor(n_neighbors=2, weights='distance', metric='manhattan')
+        model.fit(X_train_scaled, y_train)
+
+        # 2. Load Sheet Order Utama
+        all_sheets = pd.read_excel(path_order, engine="openpyxl", header=None, sheet_name=None)
+        list_df = []
+
+        for sheet_name, df_raw in all_sheets.items():
+            if 'ナカヤマ' in sheet_name: continue
+            header_row = next((i for i in range(min(25, len(df_raw))) if df_raw.iloc[i].astype(str).str.contains('品名').any()), None)
+            
+            if header_row is not None:
+                df = df_raw.iloc[header_row:].copy()
+                df.columns = df.iloc[0]
+                df = df[1:].reset_index(drop=True)
+                df = clean_cols(df)
+                
+                qty_indices = [i for i, c in enumerate(df.columns) if '受注数量' in str(c)]
+                ship_indices = [i for i, c in enumerate(df.columns) if '出荷日' in str(c)]
+                order_indices = [i for i, c in enumerate(df.columns) if '受注年月日' in str(c)]
+
+                if len(df.columns) > 23 and qty_indices:
+                    temp = pd.DataFrame()
+                    temp['品名_Original'] = df.iloc[:, 13] 
+                    temp['品名_Target_X'] = df.iloc[:, 23] 
+                    temp['Qty'] = pd.to_numeric(df.iloc[:, qty_indices[0]], errors='coerce').fillna(0)
+                    
+                    final_orders, final_ships = [], []
+                    for idx_row in range(len(df)):
+                        o_date = pd.to_datetime(df.iloc[idx_row, order_indices[0]], dayfirst=True, errors='coerce')
+                        s_date = pd.to_datetime(df.iloc[idx_row, ship_indices[0]], dayfirst=True, errors='coerce')
+                        if pd.notna(o_date) and pd.notna(s_date):
+                            s_date = s_date.replace(year=o_date.year + 1) if s_date.month < o_date.month else s_date.replace(year=o_date.year)
+                        final_orders.append(o_date)
+                        final_ships.append(s_date)
+                    
+                    temp['Shipment'] = final_ships
+                    temp['Order_Date'] = final_orders
+                    temp['Sheet'] = sheet_name
+                    
+                    temp = temp[temp['Qty'] > 0].dropna(subset=['品名_Target_X', 'Order_Date', 'Shipment'])
+                    
+                    if mode == "standard":
+                        temp = temp[~temp['品名_Original'].astype(str).str.contains('ｽﾘｰﾌﾞ|スリーブ', na=False)]
+                        temp = temp[~temp['品名_Target_X'].astype(str).str.contains('ｽﾘｰﾌﾞ|スリーブ', na=False)]
+                    list_df.append(temp)
+
+        order_df = pd.concat(list_df, ignore_index=True) if list_df else pd.DataFrame()
+
+        # 3. GABUNGKAN DATA MANUAL DARI UI
+        if mode == "combined" and df_manual_urgent is not None and not df_manual_urgent.empty:
+            order_df = pd.concat([order_df, df_manual_urgent], ignore_index=True)
+
+        if order_df.empty:
+            messagebox.showwarning("Gagal", "Tidak ada data order untuk diproses.")
+            return
+
+        # 4. PROSES KONSOLIDASI & BREAKDOWN
+        order_df = order_df.sort_values(by=['Shipment', 'Order_Date']).reset_index(drop=True)
+        order_df['Is_Merged'] = False
+        order_df['Qty_Breakdown'] = order_df['Qty'].astype(int).astype(str)
+        order_df['Original_Base_Name'] = order_df['品名_Original']
+
+        consolidated_list = []
+        skip_indices = set()
+        
+        for i in range(len(order_df)):
+            if i in skip_indices: continue
+            current_row = order_df.iloc[i].copy()
+            limit_maksimal = tentukan_max_kapasitas(current_row['品名_Target_X'])
+            
+            for j in range(i + 1, len(order_df)):
+                if j in skip_indices: continue
+                next_row = order_df.iloc[j]
+                
+                if current_row['Qty'] >= THRESHOLD_LARGE_ORDER or next_row['Qty'] >= THRESHOLD_LARGE_ORDER:
+                    break
+
+                if get_core_product_name(current_row['品名_Target_X']) == get_core_product_name(next_row['品名_Target_X']) and current_row['Sheet'] == next_row['Sheet']:
+                    selisih_hari = (next_row['Shipment'] - current_row['Shipment']).days
+                    if 0 <= selisih_hari <= 30 and (current_row['Qty'] + next_row['Qty']) <= limit_maksimal:
+                        current_row['Qty'] += next_row['Qty']  
+                        current_row['Qty_Breakdown'] += f"+{int(next_row['Qty'])}"
+                        current_row['品名_Original'] = f"{current_row['Original_Base_Name']} ({current_row['Qty_Breakdown']})"
+                        current_row['Shipment'] = min(current_row['Shipment'], next_row['Shipment'])
+                        current_row['Is_Merged'] = True 
+                        skip_indices.add(j)  
+                    else: break
+                else: break
+            consolidated_list.append(current_row)
+            
+        order_df = pd.DataFrame(consolidated_list)
+
+        # 5. PARSING DIMENSI DAN PREDIKSI ML
+        res_dim_order = order_df['品名_Target_X'].apply(lambda x: pd.Series(parse_dim_standar(x)))
+        order_df['d1'], order_df['d2'], order_df['length'] = res_dim_order[0], res_dim_order[1], res_dim_order[2]
+        
+        res_mat_order = order_df['品名_Target_X'].apply(lambda x: pd.Series(ekstrak_fitur_material(x)))
+        order_df['Fitur_JoPo'], order_df['Fitur_Polysand'] = res_mat_order[0], res_mat_order[1]
+        
+        order_df['Ada_Di_Histori'] = order_df.apply(lambda r: tentukan_status_produksi_internal(r, list_histori_matriks), axis=1)
+
+        df_lokal = order_df[order_df['Ada_Di_Histori'] == True].copy()
+        df_luar = order_df[order_df['Ada_Di_Histori'] == False].copy()
+
+        final_results = []
+
+        if not df_lokal.empty:
+            jalur_info = df_lokal.apply(lambda r: cek_jalur_spesifik(r), axis=1)
+            df_lokal['Kategori_Jalur'], df_lokal['Pengali_Durasi'] = [info[0] for info in jalur_info], [info[1] for info in jalur_info]
+            df_lokal['Hon_Dori'] = df_lokal.apply(lambda r: parse_hon_dori(r['品名_Original'], r['品名_Target_X']), axis=1)
+            df_lokal['Qty_Mesin'] = df_lokal['Qty'] / df_lokal['Hon_Dori']
+
+            X_predict = df_lokal[['d1', 'd2', 'length', 'Fitur_JoPo', 'Fitur_Polysand']]
+            X_predict_scaled = scaler.transform(X_predict)
+            df_lokal['hours_per_unit'] = np.clip(model.predict(X_predict_scaled), a_min=0.001, a_max=0.05)
+            df_lokal['Durasi_Jam'] = (df_lokal['hours_per_unit'] * df_lokal['Qty_Mesin']) * df_lokal['Pengali_Durasi']
+
+            jp_holidays = holidays.Japan(years=[2025, 2026])
+            company_custom_holidays = {'2025-08-13', '2025-08-14', '2025-08-15', '2025-12-29', '2025-12-30', '2025-12-31', '2026-01-02', '2026-01-03'}
+            company_working_saturdays = {'2025-12-27', '2025-05-10'}
+
+            queue = sorted(df_lokal.to_dict(orient='records'), key=lambda x: (x['Shipment'], x['Order_Date']))
+            current_time = queue[0]['Order_Date'].replace(hour=8, minute=30, second=0)
+            last_row = None  
+
+            while len(queue) > 0:
+                current_date_str = current_time.strftime('%Y-%m-%d')
+                if (current_time.weekday() >= 5 or current_time.date() in jp_holidays or current_date_str in company_custom_holidays) and current_date_str not in company_working_saturdays:
+                    current_time += pd.Timedelta(days=1)
+                    current_time = current_time.replace(hour=8, minute=30, second=0)
+                    continue
+
+                eligible_jobs = [job for job in queue if (job['Shipment'] - current_time).days <= (10 if job['Qty'] >= THRESHOLD_LARGE_ORDER else 30)]
+
+                if not eligible_jobs:
+                    earliest_job = min(queue, key=lambda x: x['Shipment'])
+                    next_eligible_date = earliest_job['Shipment'] - pd.Timedelta(days=10 if earliest_job['Qty'] >= THRESHOLD_LARGE_ORDER else 30)
+                    current_time = next_eligible_date.replace(hour=8, minute=30, second=0) if next_eligible_date > current_time else current_time + pd.Timedelta(days=1).replace(hour=8, minute=30, second=0)
+                    continue
+
+                job_scores = []
+                for job in eligible_jobs:
+                    skor = 25.0 * (1.0 / max((job['Shipment'] - current_time).total_seconds() / 86400, 0.5))
+                    if last_row is not None:
+                        if abs(job['d1'] - last_row['d1']) < 0.01: skor += 0.5
+                        if job['d2'] == last_row['d2']: skor += 0.1
+                        if job['Kategori_Jalur'] == last_row['Kategori_Jalur'] and job['Kategori_Jalur'] != "NORMAL": skor += 10.0
+                    skor += -1.0 * job['Durasi_Jam']
+                    skor += 0.5 * ((current_time - job['Order_Date']).total_seconds() / 86400)
+                    skor -= 1.2 * ((job['Shipment'] - current_time).total_seconds() / 86400)
+                    job_scores.append((skor, job))
+                    
+                chosen_job = max(job_scores, key=lambda x: (x[0], -x[1]['Order_Date'].timestamp()))[1]
+                row = queue.pop(queue.index(chosen_job))
+
+                setup_time_jam = get_setup_time_hours(last_row, row)
+                real_deadline_limit = row['Shipment'].replace(hour=17, minute=30, second=0)
+                is_late_risk = (current_time + pd.to_timedelta(setup_time_jam + row['Durasi_Jam'], unit='h') > real_deadline_limit)
+
+                if setup_time_jam > 0: current_time = majukan_waktu_simulasi(current_time, setup_time_jam, is_late_risk, jp_holidays, company_custom_holidays, company_working_saturdays)
+                produksi_start = current_time
+                current_time = majukan_waktu_simulasi(current_time, row['Durasi_Jam'], is_late_risk, jp_holidays, company_custom_holidays, company_working_saturdays)
+                produksi_end = current_time
+                last_row = row
+
+                bisa_dirangkum = (len(final_results) > 0 and get_core_product_name(final_results[-1]['品名_Target(X)']) == get_core_product_name(row['品名_Target_X']) and final_results[-1]['Sheet'] == row['Sheet'] and final_results[-1]['Mulai_Produksi'] != "-" and row['Qty'] < THRESHOLD_LARGE_ORDER and final_results[-1]['Total_Target_Pcs_(Hasil_Akhir)'] < THRESHOLD_LARGE_ORDER)
+
+                if bisa_dirangkum:
+                    final_results[-1]['Qty_Breakdown'] += f"+{row['Qty_Breakdown']}"
+                    final_results[-1]['品名_Original'] = f"{final_results[-1]['Original_Base_Name']} ({final_results[-1]['Qty_Breakdown']})"
+                    final_results[-1]['Total_Target_Pcs_(Hasil_Akhir)'] += int(row['Qty'])
+                    final_results[-1]['Target_Stroke/Pipa_Di_Mesin'] = int(math.ceil(final_results[-1]['Total_Target_Pcs_(Hasil_Akhir)'] / row['Hon_Dori']))
+                    final_results[-1]['Durasi_Produksi_Jam'] = round(final_results[-1]['Durasi_Produksi_Jam'] + row['Durasi_Jam'], 2)
+                    final_results[-1]['Selesai_Produksi'] = produksi_end.strftime('%Y-%m-%d  [%H:%M]')
+                    if real_deadline_limit.strftime('%Y-%m-%d') not in final_results[-1]['Tanggal_Kirim_Shipment']:
+                        final_results[-1]['Tanggal_Kirim_Shipment'] += f" , {real_deadline_limit.strftime('%Y-%m-%d')}"
+                    if "[GABUNGAN MESIN]" not in final_results[-1]['Status_Untuk_Kachou']:
+                        final_results[-1]['Status_Untuk_Kachou'] = "[GABUNGAN MESIN] " + final_results[-1]['Status_Untuk_Kachou']
+                    if produksi_end > real_deadline_limit: final_results[-1]['Status_Untuk_Kachou'] = final_results[-1]['Status_Untuk_Kachou'].replace("AMAN", "TERLAMBAT")
+                else:
+                    prefix_list = []
+                    if row['Is_Merged']: prefix_list.append("GABUNGAN MESIN")
+                    if row['Kategori_Jalur'] != "NORMAL": prefix_list.append(row['Kategori_Jalur'])
+                    if row['Fitur_JoPo'] == 1: prefix_list.append("上ポ")
+                    if row['Fitur_Polysand'] == 1: prefix_list.append("ﾎﾟﾘｻﾝﾄﾞ重")
+                    prefix = f"[{' + '.join(prefix_list)}] " if prefix_list else ""
+                    
+                    status_jadwal = f"{prefix}AMAN (SELESAI SEBELUM KIRIM)" if produksi_end <= real_deadline_limit else f"{prefix}TERLAMBAT"
+                    display_name = f"{row['Original_Base_Name']} ({row['Qty_Breakdown']})" if row['Is_Merged'] else row['品名_Original']
+
+                    final_results.append({
+                        'Sheet': row['Sheet'], 'Order_Date': row['Order_Date'].strftime('%Y-%m-%d'), 'Original_Base_Name': row['Original_Base_Name'], 'Qty_Breakdown': row['Qty_Breakdown'],
+                        '品名_Original': display_name, '品名_Target(X)': row['品名_Target_X'], 'Total_Target_Pcs_(Hasil_Akhir)': int(row['Qty']), 'Faktor_Potong': f"{row['Hon_Dori']}本取",
+                        'Target_Stroke/Pipa_Di_Mesin': int(math.ceil(row['Qty_Mesin'])), 'Waktu_Setup_Menit': int(setup_time_jam * 60), 'Durasi_Produksi_Jam': round(row['Durasi_Jam'], 2),
+                        'Mulai_Produksi': produksi_start.strftime('%Y-%m-%d  [%H:%M]'), 'Selesai_Produksi': produksi_end.strftime('%Y-%m-%d  [%H:%M]'), 'Tanggal_Kirim_Shipment': real_deadline_limit.strftime('%Y-%m-%d'),
+                        'Tipe_Shift': "LEMBUR" if is_late_risk else "NORMAL", 'Status_Untuk_Kachou': status_jadwal
+                    })
+
+        if not df_luar.empty:
+            for _, row in df_luar.sort_values(by=['Shipment', 'Order_Date']).iterrows():
+                display_name = f"{row['Original_Base_Name']} ({row['Qty_Breakdown']})" if row['Is_Merged'] else row['品名_Original']
+                final_results.append({
+                    'Sheet': row['Sheet'], 'Order_Date': row['Order_Date'].strftime('%Y-%m-%d') if pd.notna(row['Order_Date']) else "-", '品名_Original': display_name, '品名_Target(X)' : row['品名_Target_X'],
+                    'Total_Target_Pcs_(Hasil_Akhir)': int(row['Qty']), 'Faktor_Potong': "-", 'Target_Stroke/Pipa_Di_Mesin': "-", 'Waktu_Setup_Menit': 0, 'Durasi_Produksi_Jam': 0.0,
+                    'Mulai_Produksi': "-", 'Selesai_Produksi': "-", 'Tanggal_Kirim_Shipment': row['Shipment'].strftime('%Y-%m-%d') if pd.notna(row['Shipment']) else "-", 'Tipe_Shift': "-",
+                    'Status_Untuk_Kachou': f"{'[GABUNGAN MESIN] ' if row['Is_Merged'] else ''}[PRODUK DARI LUAR] Tidak Perlu Diproduksi di Mesin"
+                })
+
+        df_output = pd.DataFrame(final_results)
+        if 'Original_Base_Name' in df_output.columns: df_output = df_output.drop(columns=['Original_Base_Name', 'Qty_Breakdown'])
+        
+        output_file = "C:/Users/USER/Downloads/as/Jadwal_Produksi_Final_FixedMK18.2.xlsx"
+        df_output.to_excel(output_file, index=False)
+        messagebox.showinfo("Sukses", f"Penjadwalan Berhasil!\nFile disimpan di:\n{output_file}")
+    except Exception as e:
+        messagebox.showerror("Error", f"Terjadi kesalahan teknis:\n{str(e)}")
+
+# =============================================================
+# PANEL ANTARMUKA UI (TKINTER) - OPTIMASI PENAMAAN CLEAN
+# =============================================================
+class AppOptimasiJadwal:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("管 Schedule Optimizer Desktop - MK18.2")
+        self.root.geometry("900x550")
+        
+        self.data_manual_list = []
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        
+        lbl_frame_input = ttk.LabelFrame(root, text=" Form Input Kebutuhan Mendesak (Manual Override) ", padding=10)
+        lbl_frame_input.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+
+        ttk.Label(lbl_frame_input, text="Nama Pipa (Ex: スリーブ):").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.ent_nama = ttk.Entry(lbl_frame_input, width=25)
+        self.ent_nama.insert(0, "スリーブ")
+        self.ent_nama.grid(row=1, column=0, pady=5)
+
+        ttk.Label(lbl_frame_input, text="Outer Diameter (d1):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.ent_d1 = ttk.Entry(lbl_frame_input, width=25)
+        self.ent_d1.insert(0, "35.0")
+        self.ent_d1.grid(row=3, column=0, pady=5)
+
+        ttk.Label(lbl_frame_input, text="Thickness/Core (d2):").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.ent_d2 = ttk.Entry(lbl_frame_input, width=25)
+        self.ent_d2.insert(0, "43.0")
+        self.ent_d2.grid(row=5, column=0, pady=5)
+
+        ttk.Label(lbl_frame_input, text="Panjang Pipa (Length):").grid(row=6, column=0, sticky=tk.W, pady=2)
+        self.ent_len = ttk.Entry(lbl_frame_input, width=25)
+        self.ent_len.insert(0, "100.0")
+        self.ent_len.grid(row=7, column=0, pady=5)
+
+        ttk.Label(lbl_frame_input, text="Jumlah Pesanan (Qty Pcs):").grid(row=8, column=0, sticky=tk.W, pady=2)
+        self.ent_qty = ttk.Entry(lbl_frame_input, width=25)
+        self.ent_qty.insert(0, "800")
+        self.ent_qty.grid(row=9, column=0, pady=5)
+
+        ttk.Label(lbl_frame_input, text="Tanggal Order (YYYY-MM-DD):").grid(row=10, column=0, sticky=tk.W, pady=2)
+        self.ent_tgl_order = ttk.Entry(lbl_frame_input, width=25)
+        self.ent_tgl_order.insert(0, "2026-05-02")
+        self.ent_tgl_order.grid(row=11, column=0, pady=5)
+
+        ttk.Label(lbl_frame_input, text="Tanggal Kirim (YYYY-MM-DD):").grid(row=12, column=0, sticky=tk.W, pady=2)
+        self.ent_tgl_kirim = ttk.Entry(lbl_frame_input, width=25)
+        self.ent_tgl_kirim.insert(0, "2026-07-08")
+        self.ent_tgl_kirim.grid(row=13, column=0, pady=5)
+
+        btn_add = ttk.Button(lbl_frame_input, text="➕ Tambah Ke Daftar Antrean", command=self.tambah_ke_list)
+        btn_add.grid(row=14, column=0, pady=15, sticky=tk.EW)
+
+        right_frame = ttk.Frame(root, padding=10)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        lbl_frame_table = ttk.LabelFrame(right_frame, text=" Daftar Order Mendesak Yang Siap Ditambahkan ")
+        lbl_frame_table.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.tree = ttk.Treeview(lbl_frame_table, columns=("nama", "d1", "d2", "len", "qty", "kirim"), show="headings", height=10)
+        self.tree.heading("nama", text="Nama Item")
+        self.tree.heading("d1", text="d1")
+        self.tree.heading("d2", text="d2")
+        self.tree.heading("len", text="Length")
+        self.tree.heading("qty", text="Qty")
+        self.tree.heading("kirim", text="Tgl Kirim")
+        
+        self.tree.column("nama", width=150)
+        self.tree.column("d1", width=50)
+        self.tree.column("d2", width=50)
+        self.tree.column("len", width=60)
+        self.tree.column("qty", width=60)
+        self.tree.column("kirim", width=100)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        btn_hapus = ttk.Button(right_frame, text="🗑️ Hapus Item Terpilih", command=self.hapus_item_terpilih)
+        btn_hapus.pack(anchor=tk.E, padx=5, pady=2)
+
+        lbl_frame_run = ttk.LabelFrame(right_frame, text=" Menu Kendali Optimasi Jadwal ")
+        lbl_frame_run.pack(fill=tk.X, padx=5, pady=15)
+
+        btn_run_normal = tk.Button(lbl_frame_run, text="🚀 RUN: Data Order Standar Saja (Abaikan UI)", bg="#2196F3", fg="white", font=("Arial", 10, "bold"), height=2, command=lambda: jalankan_optimasi("standard"))
+        btn_run_normal.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=10)
+
+        btn_run_urgent = tk.Button(lbl_frame_run, text="🔥 RUN: Data Standar + Kebutuhan Mendesak UI", bg="#FF5722", fg="white", font=("Arial", 10, "bold"), height=2, command=self.eksekusi_combined)
+        btn_run_urgent.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=10, pady=10)
+
+    def helper_format_angka(self, val):
+        # Mengubah float .0 menjadi integer agar bersih (contoh: 35.0 -> 35)
+        return str(int(val)) if float(val).is_integer() else str(val)
+
+    def tambah_ke_list(self):
+        try:
+            raw_nama = self.ent_nama.get().strip()
+            d1 = float(self.ent_d1.get())
+            d2 = float(self.ent_d2.get())
+            length = float(self.ent_len.get())
+            qty = int(self.ent_qty.get())
+            tgl_o = self.ent_tgl_order.get().strip()
+            tgl_k = self.ent_tgl_kirim.get().strip()
+            
+            if not raw_nama or not tgl_o or not tgl_k:
+                raise ValueError("Data teks tidak boleh kosong kawan.")
+
+            # Bersihkan sisa-sisa simbol lama jika user tidak sengaja menginputnya
+            nama_clean = raw_nama.split(' ')[0].split('φ')[0].split('Φ')[0].strip()
+            if not nama_clean: 
+                nama_clean = "スリーブ"
+
+            # Buat format dimensi bersih (Contoh: 35*43*100)
+            dim_string_clean = f"{self.helper_format_angka(d1)}*{self.helper_format_angka(d2)}*{self.helper_format_angka(length)}"
+            nama_gabungan_final = f"{nama_clean} {dim_string_clean}"
+
+            # Tampilkan di tabel UI secara bersih
+            self.tree.insert("", tk.END, values=(nama_gabungan_final, d1, d2, length, qty, tgl_k), tags=(tgl_o,))
+            
+            # Daftarkan ke mesin data frame dengan target format standar
+            self.data_manual_list.append({
+                '品名_Original': nama_gabungan_final,
+                '品名_Target_X': dim_string_clean,  # Format bersih langsung dialirkan ke machine learning model
+                'Qty': qty,
+                'Order_Date': pd.to_datetime(tgl_o),
+                'Shipment': pd.to_datetime(tgl_k),
+                'Sheet': '[INPUT MANUAL UI] 緊急'
+            })
+        except Exception as e:
+            messagebox.showerror("Gagal Input", f"Pastikan format angka dan tanggal benar kawan.\nError: {e}")
+
+    def hapus_item_terpilih(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        for item in selected:
+            idx = self.tree.index(item)
+            self.tree.delete(item)
+            if idx < len(self.data_manual_list):
+                self.data_manual_list.pop(idx)
+
+    def eksekusi_combined(self):
+        if not self.data_manual_list:
+            messagebox.showwarning("Antrean Kosong", "Kamu belum memasukkan item mendesak di tabel atas. Silakan isi dulu.")
+            return
+        df_manual = pd.DataFrame(self.data_manual_list)
+        jalankan_optimasi("combined", df_manual)
+
+# MAIN RUNNER
+if __name__ == "__main__":
+    root_window = tk.Tk()
+    app = AppOptimasiJadwal(root_window)
+    root_window.mainloop()
